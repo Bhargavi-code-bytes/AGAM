@@ -3,6 +3,27 @@ const SESSION_KEY = "agam-session-v1";
 const THEME_KEY = "agam-theme-v1";
 const LAST_EXPORT_KEY = "agam-last-export-v1";
 
+const FIELD_ICONS = {
+  fullName: "👤", studentId: "🪪", patientId: "🪪",
+  dateOfBirth: "🎂", gender: "⚧️", phone: "📞", email: "📧",
+  address: "📍", emergencyContact: "🚨",
+  martialArtsStyle: "🥋", beltRank: "🏅",
+  takingTreatment: "💊", treatmentPlan: "📋",
+  therapyNotes: "📝", progressNotes: "📈", medicalHistory: "🏥",
+  medicalNotes: "📝", visitHistory: "🗓", contact: "📞",
+  joinDate: "📅", photo: "🖼️", notes: "📝",
+  name: "🏷️", style: "🥋", instructor: "👨‍🏫",
+  day: "📅", time: "⏰", capacity: "👥", studentIds: "🧑‍🎓",
+  patientName: "🧑‍⚕️", date: "📅", purpose: "🎯",
+  reminder: "🔔",
+  ownerName: "👤", ownerType: "🏷️", category: "📂",
+  amount: "💵", paidOn: "📅", method: "💳", reference: "🔖",
+  personName: "👤", personType: "🏷️", className: "🏫",
+  status: "🔘", active: "✅",
+  username: "👤", password: "🔑",
+  currentPassword: "🔑", newPassword: "🔑", confirmPassword: "🔑",
+};
+
 const roleConfig = {
   super_admin: { label: "Super Admin", scopes: ["students", "patients", "therapeutic", "payments", "attendance", "schedule", "reports", "audit", "settings"] },
   student_admin: { label: "Student Admin", scopes: ["students", "therapeutic", "attendance", "schedule", "reports"] },
@@ -975,7 +996,14 @@ function openRecordForm(type, id = null) {
 function saveRecord(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const data = Object.fromEntries(new FormData(form).entries());
+  const formData = new FormData(form);
+  const data = Object.fromEntries(formData.entries());
+  // Collect all checked checkboxes (multi-select) and all <select multiple> by name
+  const multiNames = new Set([
+    ...Array.from(form.querySelectorAll("select[multiple]")).map(s => s.name),
+    ...Array.from(form.querySelectorAll(".ms-container")).map(c => c.querySelector("input[type=checkbox]")?.name).filter(Boolean),
+  ]);
+  multiNames.forEach(name => { data[name] = formData.getAll(name); });
   const type = data.type;
   const id = data.id || cryptoId();
   const collection = getCollection(type);
@@ -1049,7 +1077,7 @@ function buildRecord(type, data, id) {
         day: data.day,
         time: data.time,
         capacity: Number(data.capacity || 0),
-        studentIds: data.studentIds ? data.studentIds.split(",").map(value => value.trim()).filter(Boolean) : [],
+        studentIds: Array.isArray(data.studentIds) ? data.studentIds.filter(Boolean) : (data.studentIds ? String(data.studentIds).split(",").map(v => v.trim()).filter(Boolean) : []),
       };
     case "appointments":
       return {
@@ -1127,10 +1155,10 @@ function getFormFields(type) {
       { name: "day", label: "Day", type: "select", options: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], optionLabels: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"] },
       { name: "time", label: "Time", type: "time" },
       { name: "capacity", label: "Capacity", type: "number" },
-      { name: "studentIds", label: "Student IDs (comma-separated)" },
+      { name: "studentIds", label: "Students", type: "multiselect", source: "students" },
     ],
     appointments: [
-      { name: "patientName", label: "Patient name", required: true },
+      { name: "patientName", label: "Patient name", required: true, type: "select-source", source: "patients" },
       { name: "date", label: "Date", type: "date" },
       { name: "time", label: "Time", type: "time" },
       { name: "purpose", label: "Purpose" },
@@ -1148,7 +1176,7 @@ function getFormFields(type) {
       { name: "notes", label: "Notes", type: "textarea" },
     ],
     attendance: [
-      { name: "personName", label: "Person name", required: true },
+      { name: "personName", label: "Person name", required: true, type: "select-persons" },
       { name: "personType", label: "Person type", type: "select", options: ["student", "patient"], optionLabels: ["Student", "Patient"] },
       { name: "className", label: "Class name" },
       { name: "date", label: "Date", type: "date" },
@@ -1160,17 +1188,50 @@ function getFormFields(type) {
 
 function formControl(field, value) {
   const req = field.required ? " <span class='req'>*</span>" : "";
+  const icon = FIELD_ICONS[field.name] ? `<span class="field-icon">${FIELD_ICONS[field.name]}</span> ` : "";
+  const labelHtml = `${icon}${field.label}`;
+  if (field.type === "multiselect") {
+    const sourceData = appState.data[field.source] || [];
+    const selected = Array.isArray(value) ? value : (value ? String(value).split(",").map(v => v.trim()) : []);
+    const msId = "ms-" + field.name;
+    const options = sourceData.map(item => {
+      const chk = selected.includes(item.id) ? "checked" : "";
+      return `<label class="ms-option"><input type="checkbox" name="${field.name}" value="${escapeHtml(item.id)}" ${chk} data-ms-parent="${msId}"> <span>${escapeHtml(item.fullName || item.id)}</span></label>`;
+    }).join("");
+    const tags = selected.map(id => {
+      const item = sourceData.find(s => s.id === id);
+      if (!item) return "";
+      return `<span class="ms-tag">${escapeHtml(item.fullName || id)}<button type="button" class="ms-tag-remove" data-ms-remove="${msId}" data-ms-val="${escapeHtml(id)}">×</button></span>`;
+    }).join("");
+    const placeholder = selected.length === 0 ? `<span class="ms-placeholder">Select students…</span>` : "";
+    return `<div class="form-group"><label>${labelHtml}${req}</label><div class="ms-container" id="${msId}"><div class="ms-trigger form-control" data-ms-toggle="${msId}"><div class="ms-tags-wrap" id="${msId}-tags">${tags}${placeholder}</div><span class="ms-arrow">▾</span></div><div class="ms-dropdown" id="${msId}-dropdown"><input class="ms-search" type="text" placeholder="Search…" data-ms-search="${msId}"><div class="ms-options" id="${msId}-options">${options}</div></div></div></div>`;
+  }
+  if (field.type === "select-persons") {
+    const students = appState.data.students || [];
+    const patients = appState.data.patients || [];
+    const studentOpts = students.map(s => `<option value="${escapeHtml(s.fullName)}" ${value === s.fullName ? "selected" : ""}>${escapeHtml(s.fullName)}</option>`).join("");
+    const patientOpts = patients.map(p => `<option value="${escapeHtml(p.fullName)}" ${value === p.fullName ? "selected" : ""}>${escapeHtml(p.fullName)}</option>`).join("");
+    return `<div class="form-group"><label>${labelHtml}${req}</label><select class="form-control" name="${field.name}" required><option value="">Select person…</option>${studentOpts ? `<optgroup label="Students">${studentOpts}</optgroup>` : ""}${patientOpts ? `<optgroup label="Patients">${patientOpts}</optgroup>` : ""}</select></div>`;
+  }
+  if (field.type === "select-source") {
+    const sourceData = appState.data[field.source] || [];
+    const opts = [`<option value="">Select…</option>`, ...sourceData.map(item => {
+      const name = item.fullName || item.name || item.id;
+      return `<option value="${escapeHtml(name)}" ${value === name ? "selected" : ""}>${escapeHtml(name)}</option>`;
+    })].join("");
+    return `<div class="form-group"><label>${labelHtml}${req}</label><select class="form-control" name="${field.name}" ${field.required ? "required" : ""}>${opts}</select></div>`;
+  }
   if (field.type === "textarea") {
-    return `<div class="form-group"><label>${field.label}${req}</label><textarea class="form-control" name="${field.name}" rows="3">${escapeHtml(value)}</textarea></div>`;
+    return `<div class="form-group"><label>${labelHtml}${req}</label><textarea class="form-control" name="${field.name}" rows="3">${escapeHtml(value)}</textarea></div>`;
   }
   if (field.type === "select") {
     const labels = field.optionLabels || field.options;
-    return `<div class="form-group"><label>${field.label}${req}</label><select class="form-control" name="${field.name}">${field.options.map((option, i) => `<option value="${escapeHtml(option)}" ${String(value) === String(option) ? "selected" : ""}>${escapeHtml(labels[i] || option)}</option>`).join("")}</select></div>`;
+    return `<div class="form-group"><label>${labelHtml}${req}</label><select class="form-control" name="${field.name}">${field.options.map((option, i) => `<option value="${escapeHtml(option)}" ${String(value) === String(option) ? "selected" : ""}>${escapeHtml(labels[i] || option)}</option>`).join("")}</select></div>`;
   }
   if (field.type === "checkbox") {
-    return `<div class="form-group form-group-check"><label><input type="checkbox" name="${field.name}" ${value ? "checked" : ""} /> ${field.label}</label></div>`;
+    return `<div class="form-group form-group-check"><label><input type="checkbox" name="${field.name}" ${value ? "checked" : ""} /> ${labelHtml}</label></div>`;
   }
-  return `<div class="form-group"><label>${field.label}${req}</label><input class="form-control" name="${field.name}" type="${field.type || "text"}" value="${escapeHtml(value)}" ${field.required ? "required" : ""} /></div>`;
+  return `<div class="form-group"><label>${labelHtml}${req}</label><input class="form-control" name="${field.name}" type="${field.type || "text"}" value="${escapeHtml(value)}" ${field.required ? "required" : ""} /></div>`;
 }
 
 function changePassword(event) {
@@ -1429,6 +1490,71 @@ function getStoredTheme() {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
 }
+
+/* ── Custom multi-select dropdown (CSP-safe, event delegation) ── */
+function msUpdateTags(msId) {
+  const container = document.getElementById(msId);
+  const tagsWrap = document.getElementById(msId + "-tags");
+  if (!container || !tagsWrap) return;
+  const checked = container.querySelectorAll("input[type=checkbox]:checked");
+  if (checked.length === 0) {
+    tagsWrap.innerHTML = `<span class="ms-placeholder">Select students…</span>`;
+    return;
+  }
+  tagsWrap.innerHTML = Array.from(checked).map(cb => {
+    const name = cb.nextElementSibling ? cb.nextElementSibling.textContent : cb.value;
+    return `<span class="ms-tag">${escapeHtml(name)}<button type="button" class="ms-tag-remove" data-ms-remove="${msId}" data-ms-val="${escapeHtml(cb.value)}">×</button></span>`;
+  }).join("");
+}
+
+document.addEventListener("click", function(e) {
+  // Toggle open/close
+  const toggle = e.target.closest("[data-ms-toggle]");
+  if (toggle) {
+    const msId = toggle.dataset.msToggle;
+    const dropdown = document.getElementById(msId + "-dropdown");
+    if (!dropdown) return;
+    const isOpen = dropdown.classList.contains("ms-open");
+    document.querySelectorAll(".ms-dropdown.ms-open").forEach(d => d.classList.remove("ms-open"));
+    if (!isOpen) {
+      dropdown.classList.add("ms-open");
+      dropdown.querySelector(".ms-search")?.focus();
+    }
+    e.stopPropagation();
+    return;
+  }
+  // Remove tag
+  const removeBtn = e.target.closest("[data-ms-remove]");
+  if (removeBtn) {
+    const msId = removeBtn.dataset.msRemove;
+    const val = removeBtn.dataset.msVal;
+    const cb = document.querySelector("#" + msId + "-options input[value='" + CSS.escape(val) + "']");
+    if (cb) cb.checked = false;
+    msUpdateTags(msId);
+    e.stopPropagation();
+    return;
+  }
+  // Close if clicking outside any ms-container
+  if (!e.target.closest(".ms-container")) {
+    document.querySelectorAll(".ms-dropdown.ms-open").forEach(d => d.classList.remove("ms-open"));
+  }
+});
+
+document.addEventListener("change", function(e) {
+  const cb = e.target.closest("[data-ms-parent]");
+  if (cb) msUpdateTags(cb.dataset.msParent);
+});
+
+document.addEventListener("input", function(e) {
+  const search = e.target.closest("[data-ms-search]");
+  if (!search) return;
+  const msId = search.dataset.msSearch;
+  const q = search.value.toLowerCase();
+  document.querySelectorAll("#" + msId + "-options .ms-option").forEach(opt => {
+    opt.style.display = opt.textContent.toLowerCase().includes(q) ? "" : "none";
+  });
+});
+/* ─────────────────────────────────────────────────────────────── */
 
 function toast(message) {
   const existing = document.querySelector(".toast");
