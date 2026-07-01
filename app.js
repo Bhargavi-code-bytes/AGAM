@@ -3,6 +3,94 @@ const SESSION_KEY = "agam-session-v1";
 const THEME_KEY = "agam-theme-v1";
 const LAST_EXPORT_KEY = "agam-last-export-v1";
 
+// ─── Supabase cloud sync ───────────────────────────────────────────────────────
+// Set window.SUPABASE_URL and window.SUPABASE_KEY in config.js to enable.
+// Collections synced to cloud (users excluded — contains passwords).
+const CLOUD_COLLECTIONS = ["students", "patients", "classes", "appointments", "payments", "attendance", "auditLog"];
+let cloudStatus = "idle"; // "idle" | "syncing" | "online" | "offline"
+
+function cloudEnabled() {
+  return typeof window.SUPABASE_URL === "string" && window.SUPABASE_URL.startsWith("https://") &&
+         typeof window.SUPABASE_KEY === "string" && window.SUPABASE_KEY.length > 10;
+}
+
+async function sbFetch(method, path, body) {
+  const url = `${window.SUPABASE_URL}/rest/v1/${path}`;
+  const headers = {
+    "apikey": window.SUPABASE_KEY,
+    "Authorization": `Bearer ${window.SUPABASE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  if (method === "POST") headers["Prefer"] = "resolution=merge-duplicates,return=minimal";
+  const res = await fetch(url, { method, headers, body: body != null ? JSON.stringify(body) : undefined });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase ${method} ${path}: ${res.status} ${text}`);
+  }
+  if (method === "GET") return res.json();
+  return null;
+}
+
+async function cloudUpsertCollection(collection) {
+  if (!cloudEnabled()) return;
+  await sbFetch("POST", "agam_sync?on_conflict=collection", {
+    collection,
+    payload: appState.data[collection] || [],
+    updated_at: new Date().toISOString(),
+  });
+}
+
+async function cloudSyncAll() {
+  if (!cloudEnabled()) return;
+  setCloudStatus("syncing");
+  try {
+    await Promise.all(CLOUD_COLLECTIONS.map(c => cloudUpsertCollection(c)));
+    setCloudStatus("online");
+  } catch (e) {
+    console.warn("Cloud sync failed:", e.message);
+    setCloudStatus("offline");
+  }
+}
+
+async function loadFromCloud() {
+  if (!cloudEnabled()) return;
+  setCloudStatus("syncing");
+  try {
+    const rows = await sbFetch("GET", "agam_sync?select=collection,payload");
+    if (!Array.isArray(rows) || rows.length === 0) {
+      // Nothing in cloud yet — push local data up
+      await cloudSyncAll();
+      return;
+    }
+    let changed = false;
+    for (const row of rows) {
+      if (row.collection && CLOUD_COLLECTIONS.includes(row.collection) && Array.isArray(row.payload)) {
+        appState.data[row.collection] = row.payload;
+        changed = true;
+      }
+    }
+    if (changed) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(appState.data));
+      render();
+    }
+    setCloudStatus("online");
+  } catch (e) {
+    console.warn("Cloud load failed:", e.message);
+    setCloudStatus("offline");
+  }
+}
+
+function setCloudStatus(status) {
+  cloudStatus = status;
+  const dot = document.querySelector(".cloud-sync-dot");
+  if (!dot) return;
+  const labels = { idle: "Cloud: not configured", syncing: "Cloud: syncing…", online: "Cloud: synced ✓", offline: "Cloud: offline — check connection" };
+  dot.className = `cloud-sync-dot cloud-${status}`;
+  dot.title = labels[status] || "";
+  dot.textContent = { idle: "☁️", syncing: "🔄", online: "☁️ ✓", offline: "☁️ ✗" }[status] || "☁️";
+}
+// ──────────────────────────────────────────────────────────────────────────────
+
 const FIELD_ICONS = {
   fullName: "👤", studentId: "🪪", patientId: "🪪",
   dateOfBirth: "🎂", gender: "⚧️", phone: "📞", email: "📧",
@@ -11,7 +99,7 @@ const FIELD_ICONS = {
   takingTreatment: "💊", treatmentPlan: "📋",
   therapyNotes: "📝", progressNotes: "📈", medicalHistory: "🏥",
   medicalNotes: "📝", visitHistory: "🗓", contact: "📞",
-  joinDate: "📅", photo: "🖼️", notes: "📝",
+  joinDate: "📅", photo: "🖼️", notes: "📝", linkedStudentId: "🥋",
   name: "🏷️", style: "🥋", instructor: "👨‍🏫",
   day: "📅", time: "⏰", capacity: "👥", studentIds: "🧑‍🎓",
   patientName: "🧑‍⚕️", date: "📅", purpose: "🎯",
@@ -88,6 +176,7 @@ function bootstrap() {
   applyTheme(getStoredTheme());
   render();
   tryReconnectFile();
+  loadFromCloud(); // async, re-renders when cloud data arrives
 }
 
 function render() {
@@ -183,6 +272,7 @@ function renderShell(user) {
             }
           </div>
           ${appState.filePendingReconnect ? `<button class="reconnect-btn" data-action="reconnect-file">📢 Tap to reconnect file</button>` : ""}
+          ${cloudEnabled() ? `<div class="cloud-info"><span class="cloud-sync-dot cloud-${cloudStatus}" title="Cloud sync status">☁️</span> <span class="small-text">Cloud sync ${cloudStatus === "online" ? "✓" : cloudStatus === "syncing" ? "…" : cloudStatus === "offline" ? "✗ offline" : "ready"}</span></div>` : ""}
           <div class="sidebar-actions">
             <button data-action="toggle-theme" title="Toggle dark/light mode">🌓 Theme</button>
             <button data-action="open-password" title="Change password">🔑 Password</button>
@@ -201,7 +291,7 @@ function renderShell(user) {
             </div>
           </div>
           <div class="topbar-actions">
-            <button class="ghost-button" data-action="backup-json">⬇ Export</button>
+            <button class="ghost-button" data-action="backup-json">⬇ Excel</button>
             <button class="ghost-button" data-action="import-json">⬆ Import</button>
             ${quickAddLabel ? `<button class="primary-button" data-action="quick-add">${quickAddLabel}</button>` : ""}
           </div>
@@ -214,20 +304,28 @@ function renderShell(user) {
 }
 
 function renderModule(user, moduleId) {
+  // Guard: redirect to dashboard if user lacks scope for this module
+  const openModules = ["dashboard", "profile", "audit", "settings"];
+  if (!openModules.includes(moduleId) && !hasScope(user.role, moduleId)) {
+    return `<div class="empty-state" style="margin:80px auto;"><div class="empty-icon">🔒</div><p><strong>Access restricted</strong></p><p class="small-text">Your account (${escapeHtml(roleConfig[user.role].label)}) does not have access to this section.</p></div>`;
+  }
+  if ((moduleId === "audit" || moduleId === "settings") && user.role !== "super_admin") {
+    return `<div class="empty-state" style="margin:80px auto;"><div class="empty-icon">🔒</div><p><strong>Super Admin only</strong></p><p class="small-text">Only the Super Admin account can access this section.</p></div>`;
+  }
   switch (moduleId) {
-    case "dashboard": return renderDashboard(user);
-    case "students": return renderPeopleModule("students", user);
-    case "patients": return renderPeopleModule("patients", user);
-    case "therapeutic": return renderTherapeuticModule(user);
-    case "attendance": return renderAttendanceModule(user);
-    case "schedule": return renderScheduleModule(user);
-    case "appointments": return renderAppointmentsModule(user);
-    case "payments": return renderPaymentsModule(user);
-    case "reports": return renderReportsModule(user);
-    case "audit": return renderAuditModule(user);
-    case "profile": return renderProfileModule(user);
-    case "settings": return renderSettingsModule(user);
-    default: return renderDashboard(user);
+    case "dashboard":     return renderDashboard(user);
+    case "students":      return renderPeopleModule("students", user);
+    case "patients":      return renderPeopleModule("patients", user);
+    case "therapeutic":   return renderTherapeuticModule(user);
+    case "attendance":    return renderAttendanceModule(user);
+    case "schedule":      return renderScheduleModule(user);
+    case "appointments":  return renderAppointmentsModule(user);
+    case "payments":      return renderPaymentsModule(user);
+    case "reports":       return renderReportsModule(user);
+    case "audit":         return renderAuditModule(user);
+    case "profile":       return renderProfileModule(user);
+    case "settings":      return renderSettingsModule(user);
+    default:              return renderDashboard(user);
   }
 }
 
@@ -312,6 +410,7 @@ function renderTherapeuticModule(user) {
 
 function renderDashboard(user) {
   const today = todayISO();
+  const r = user.role;
   const activeMembers = appState.data.students.filter(student => student.active !== false).length;
   const upcomingAppointments = appState.data.appointments.filter(item => item.date >= today).slice(0, 5);
   const paymentsTotal = appState.data.payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
@@ -320,22 +419,36 @@ function renderDashboard(user) {
   const greeting = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
   const firstName = user.name.split(" ")[0] || user.name;
 
+  // Role-specific widgets
+  const allWidgets = [
+    { id: "students",     scope: "students",     icon: "🥋", label: "Students",       value: appState.data.students.length,     note: `${activeMembers} active` },
+    { id: "patients",     scope: "patients",     icon: "🏥", label: "Patients",        value: appState.data.patients.length,     note: "Therapy records" },
+    { id: "schedule",     scope: "schedule",     icon: "📅", label: "Today's classes", value: classesToday.length,               note: "Scheduled today" },
+    { id: "appointments", scope: "appointments", icon: "🗓", label: "Appointments",    value: upcomingAppointments.length,       note: "Upcoming" },
+    { id: "payments",     scope: "payments",     icon: "💰", label: "Payments",        value: formatCurrency(paymentsTotal),     note: "Total income" },
+    { id: "attendance",   scope: "attendance",   icon: "✅", label: "Attendance today",value: appState.data.attendance.filter(a => a.date === today).length, note: "Records today" },
+  ];
+  const visibleWidgets = allWidgets.filter(w => hasScope(r, w.scope));
+
+  // Role-specific quick actions
+  const allActions = [
+    { scope: "students",     action: "new-student",      icon: "🥋", label: "Add Student" },
+    { scope: "patients",     action: "new-patient",      icon: "🏥", label: "Add Patient" },
+    { scope: "attendance",   action: "mark-attendance",  icon: "✅", label: "Mark Attendance" },
+    { scope: "payments",     action: "new-payment",      icon: "💰", label: "Record Payment" },
+    { scope: "appointments", action: "new-appointment",  icon: "🗓", label: "New Appointment" },
+    { scope: "schedule",     action: "new-class",        icon: "📅", label: "Create Class" },
+  ];
+  const visibleActions = allActions.filter(a => hasScope(r, a.scope));
+
   return `
     <div class="layout-grid dashboard-sections">
       <div class="dashboard-welcome"><span>${greeting}, ${escapeHtml(firstName)} 👋</span><span class="small-text">${new Date().toLocaleDateString(undefined, { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</span></div>
       <section class="widgets">
-        <article class="widget widget-clickable" data-module="students"><div class="widget-icon">🥋</div><div class="label">Students</div><div class="value">${appState.data.students.length}</div><div class="note">${activeMembers} active</div></article>
-        <article class="widget widget-clickable" data-module="patients"><div class="widget-icon">🏥</div><div class="label">Patients</div><div class="value">${appState.data.patients.length}</div><div class="note">Therapy records</div></article>
-        <article class="widget widget-clickable" data-module="schedule"><div class="widget-icon">📅</div><div class="label">Today's classes</div><div class="value">${classesToday.length}</div><div class="note">Scheduled today</div></article>
-        <article class="widget widget-clickable" data-module="payments"><div class="widget-icon">💰</div><div class="label">Payments</div><div class="value">${formatCurrency(paymentsTotal)}</div><div class="note">Total income</div></article>
+        ${visibleWidgets.map(w => `<article class="widget widget-clickable" data-module="${w.id}"><div class="widget-icon">${w.icon}</div><div class="label">${w.label}</div><div class="value">${escapeHtml(String(w.value))}</div><div class="note">${w.note}</div></article>`).join("")}
       </section>
       <div class="quick-actions">
-        <button class="quick-action-btn" data-action="new-student">🥋 Add Student</button>
-        <button class="quick-action-btn" data-action="new-patient">🏥 Add Patient</button>
-        <button class="quick-action-btn" data-action="mark-attendance">✅ Mark Attendance</button>
-        <button class="quick-action-btn" data-action="new-payment">💰 Record Payment</button>
-        <button class="quick-action-btn" data-action="new-appointment">🗓 New Appointment</button>
-        <button class="quick-action-btn" data-action="new-class">📅 Create Class</button>
+        ${visibleActions.map(a => `<button class="quick-action-btn" data-action="${a.action}">${a.icon} ${a.label}</button>`).join("")}
       </div>
       <section class="grid-2">
         <div class="panel">
@@ -407,7 +520,7 @@ function renderPeopleModule(type, user) {
                 ${visibleItems.map(item => `
                   <tr>
                     <td><strong>${escapeHtml(item.fullName)}</strong><br /><span class="small-text">${escapeHtml(item.gender || item.treatmentPlan || "")}</span></td>
-                    <td>${escapeHtml(item.studentId || item.patientId || item.id)}</td>
+                    <td>${escapeHtml(item.studentId || item.patientId || "—")}</td>
                     <td>${escapeHtml(item.phone || item.email || item.contact || "")}</td>
                     <td>${statusBadge(item.active !== false ? "Active" : "Inactive", item.active !== false ? "success" : "neutral")}</td>
                     <td class="small-text">${escapeHtml((item.notes || item.progressNotes || item.medicalNotes || "").slice(0, 60))}${(item.notes || item.progressNotes || item.medicalNotes || "").length > 60 ? "…" : ""}</td>
@@ -826,9 +939,18 @@ function bindLogin() {
 }
 
 function bindShell(user) {
+  // On login, reset to dashboard if current module is not in visible set
+  const visibleIds = getVisibleModules(user.role).map(m => m.id);
+  if (!visibleIds.includes(appState.selectedModule)) {
+    appState.selectedModule = "dashboard";
+  }
+
   document.querySelectorAll("[data-module]").forEach(el => {
     el.addEventListener("click", () => {
-      appState.selectedModule = el.dataset.module;
+      const target = el.dataset.module;
+      // Silently ignore navigation to modules the user can't access
+      if (!visibleIds.includes(target)) return;
+      appState.selectedModule = target;
       appState.selectedId = null;
       appState.search = "";
       appState.filters = {};
@@ -917,7 +1039,7 @@ function handleAction(event) {
     case "new-payment": openRecordForm("payments"); break;
     case "mark-attendance": openRecordForm("attendance"); break;
     case "import-json": document.getElementById("file-import")?.click(); break;
-    case "backup-json": exportJson(); break;
+    case "backup-json": exportModuleCsv(appState.selectedModule); break;
     case "connect-file-open": connectToFileOpen(); break;
     case "connect-file-new": connectToFileNew(); break;
     case "disconnect-file": disconnectFile(); break;
@@ -1034,11 +1156,17 @@ function deleteRecord(type, id) {
 function buildRecord(type, data, id) {
   const base = { id, active: data.active !== "false" };
   switch (type) {
-    case "students":
+    case "students": {
+      const autoStudentId = (() => {
+        if (data.studentId) return data.studentId;
+        const nums = appState.data.students.map(s => parseInt((s.studentId || "").replace(/\D/g, ""), 10)).filter(n => !isNaN(n));
+        const next = nums.length ? Math.max(...nums) + 1 : 1001;
+        return `S-${next}`;
+      })();
       return {
         ...base,
         fullName: data.fullName,
-        studentId: data.studentId,
+        studentId: autoStudentId,
         photo: data.photo,
         dateOfBirth: data.dateOfBirth,
         gender: data.gender,
@@ -1055,19 +1183,28 @@ function buildRecord(type, data, id) {
         therapyNotes: data.therapyNotes,
         active: data.active !== "false",
       };
-    case "patients":
+    }
+    case "patients": {
+      const autoPatientId = (() => {
+        if (data.patientId) return data.patientId;
+        const nums = appState.data.patients.map(p => parseInt((p.patientId || "").replace(/\D/g, ""), 10)).filter(n => !isNaN(n));
+        const next = nums.length ? Math.max(...nums) + 1 : 2001;
+        return `P-${next}`;
+      })();
       return {
         ...base,
         fullName: data.fullName,
-        patientId: data.patientId,
+        patientId: autoPatientId,
         contact: data.contact,
         treatmentPlan: data.treatmentPlan,
         medicalHistory: data.medicalHistory,
         medicalNotes: data.medicalNotes,
         progressNotes: data.progressNotes,
         visitHistory: data.visitHistory,
+        linkedStudentId: data.linkedStudentId || "",
         active: data.active !== "false",
       };
+    }
     case "classes":
       return {
         ...base,
@@ -1115,7 +1252,7 @@ function buildRecord(type, data, id) {
   }
 }
 
-function getFormFields(type) {
+function getFormFields(type, item) {
   const common = [
     { name: "active", label: "Status", type: "select", options: ["true", "false"], optionLabels: ["Active", "Inactive"] },
   ];
@@ -1142,6 +1279,7 @@ function getFormFields(type) {
       { name: "fullName", label: "Full name", required: true },
       { name: "patientId", label: "Patient ID" },
       { name: "contact", label: "Contact information", type: "tel" },
+      { name: "linkedStudentId", label: "Linked student", type: "select-source", source: "students" },
       { name: "treatmentPlan", label: "Treatment plan" },
       { name: "medicalHistory", label: "Medical history", type: "textarea" },
       { name: "medicalNotes", label: "Medical notes", type: "textarea" },
@@ -1166,8 +1304,8 @@ function getFormFields(type) {
       { name: "reminder", label: "Enable reminder", type: "checkbox" },
     ],
     payments: [
-      { name: "ownerName", label: "Person name", required: true },
       { name: "ownerType", label: "Person type", type: "select", options: ["student", "patient"], optionLabels: ["Student", "Patient"] },
+      { name: "ownerName", label: "Person name", required: true, type: "select-persons-typed", initialType: item?.ownerType || "student" },
       { name: "category", label: "Fee category", type: "select", options: ["", "Membership Fee", "Therapy Fee", "Registration Fee", "Grading Fee", "Other"], optionLabels: ["Select…", "Membership Fee", "Therapy Fee", "Registration Fee", "Grading Fee", "Other"] },
       { name: "amount", label: "Amount", type: "number", required: true },
       { name: "paidOn", label: "Payment date", type: "date" },
@@ -1221,6 +1359,12 @@ function formControl(field, value) {
     })].join("");
     return `<div class="form-group"><label>${labelHtml}${req}</label><select class="form-control" name="${field.name}" ${field.required ? "required" : ""}>${opts}</select></div>`;
   }
+  if (field.type === "select-persons-typed") {
+    const initType = field.initialType || "student";
+    const people = (initType === "patient" ? appState.data.patients : appState.data.students) || [];
+    const opts = `<option value="">Select ${initType}…</option>` + people.map(p => `<option value="${escapeHtml(p.fullName)}" ${value === p.fullName ? "selected" : ""}>${escapeHtml(p.fullName)}</option>`).join("");
+    return `<div class="form-group"><label>${labelHtml}${req}</label><select class="form-control" name="${field.name}" data-persons-select="true" ${field.required ? "required" : ""}>${opts}</select></div>`;
+  }
   if (field.type === "textarea") {
     return `<div class="form-group"><label>${labelHtml}${req}</label><textarea class="form-control" name="${field.name}" rows="3">${escapeHtml(value)}</textarea></div>`;
   }
@@ -1267,6 +1411,64 @@ function exportJson() {
   localStorage.setItem(LAST_EXPORT_KEY, new Date().toISOString());
   recordAudit("Export", "Full JSON backup exported", "settings", "success");
   toast("✅ Backup downloaded. Copy this file to transfer data to another device.");
+}
+
+function exportModuleCsv(moduleId) {
+  const d = appState.data;
+  let headers = [];
+  let rows = [];
+  let sheetName = moduleId;
+
+  switch (moduleId) {
+    case "students":
+      headers = ["Student ID", "Full Name", "Gender", "Date of Birth", "Phone", "Email", "Address", "Emergency Contact", "Style", "Belt Rank", "Join Date", "Active", "Taking Treatment", "Treatment Plan", "Therapy Notes", "Notes"];
+      rows = d.students.map(s => [s.studentId, s.fullName, s.gender, s.dateOfBirth, s.phone, s.email, s.address, s.emergencyContact, s.martialArtsStyle, s.beltRank, s.joinDate, s.active ? "Yes" : "No", s.takingTreatment ? "Yes" : "No", s.treatmentPlan, s.therapyNotes, s.notes]);
+      sheetName = "Students";
+      break;
+    case "patients":
+      headers = ["Patient ID", "Full Name", "Contact", "Treatment Plan", "Medical History", "Medical Notes", "Progress Notes", "Visit History", "Active"];
+      rows = d.patients.map(p => [p.patientId, p.fullName, p.contact, p.treatmentPlan, p.medicalHistory, p.medicalNotes, p.progressNotes, p.visitHistory, p.active ? "Yes" : "No"]);
+      sheetName = "Patients";
+      break;
+    case "payments":
+      headers = ["Reference", "Person Type", "Person Name", "Category", "Amount", "Paid On", "Method", "Notes"];
+      rows = d.payments.map(p => [p.reference, p.ownerType, p.ownerName, p.category, p.amount, p.paidOn, p.method, p.notes]);
+      sheetName = "Payments";
+      break;
+    case "attendance":
+      headers = ["Date", "Person Type", "Person Name", "Class", "Status"];
+      rows = d.attendance.map(a => [a.date, a.personType, a.personName, a.className, a.status]);
+      sheetName = "Attendance";
+      break;
+    case "appointments":
+      headers = ["Date", "Time", "Patient Name", "Purpose", "Notes", "Reminder"];
+      rows = d.appointments.map(a => [a.date, a.time, a.patientName, a.purpose, a.notes, a.reminder ? "Yes" : "No"]);
+      sheetName = "Appointments";
+      break;
+    case "schedule":
+      headers = ["Class Name", "Style", "Instructor", "Day", "Time", "Capacity", "Enrolled Students"];
+      rows = d.classes.map(c => [c.name, c.style, c.instructor, c.day, c.time, c.capacity, (c.studentIds || []).length]);
+      sheetName = "Classes";
+      break;
+    default:
+      // Fallback: full JSON backup
+      exportJson();
+      return;
+  }
+
+  const csvEscape = v => `"${String(v ?? "").replaceAll('"', '""')}"`;
+  const csv = [headers, ...rows].map(row => row.map(csvEscape).join(",")).join("\n");
+  // UTF-8 BOM ensures Excel opens the file with correct encoding
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `agam-${sheetName.toLowerCase()}-${todayISO()}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+  localStorage.setItem(LAST_EXPORT_KEY, new Date().toISOString());
+  recordAudit("Export", `${sheetName} exported as CSV/Excel`, moduleId, "success");
+  toast(`✅ ${sheetName} exported — open in Excel or Google Sheets.`);
 }
 
 function exportCsv() {
@@ -1359,8 +1561,8 @@ function recordAudit(title, detail, level = "general", badge = "neutral") {
 function getVisibleModules(role) {
   const d = appState.data;
   const modules = [
-    { id: "dashboard", title: "Dashboard", icon: "🏠" },
-    { id: "students", title: "Students", icon: "🥋", count: d.students.length },
+    { id: "dashboard",   title: "Dashboard",       icon: "🏠" },
+    { id: "students",    title: "Students",         icon: "🥋",  count: d.students.length },
     { id: "patients", title: "Patients", icon: "🏥", count: d.patients.length },
     { id: "therapeutic", title: "Therapeutic", icon: "🧘", count: d.patients.length + d.students.filter(s => s.takingTreatment).length },
     { id: "attendance", title: "Attendance", icon: "✅", count: d.attendance.filter(a => a.date === todayISO()).length },
@@ -1372,8 +1574,11 @@ function getVisibleModules(role) {
     { id: "profile", title: "Profile", icon: "👤" },
     { id: "settings", title: "Backup / Storage", icon: "💾" },
   ];
-  const scopes = roleConfig[role].scopes;
-  return modules.filter(module => module.id === "dashboard" || module.id === "profile" || module.id === "settings" || module.id === "audit" || hasScope(role, module.id) || scopes.includes(module.id));
+  return modules.filter(module => {
+    if (module.id === "dashboard" || module.id === "profile") return true;
+    if (module.id === "audit" || module.id === "settings") return role === "super_admin";
+    return hasScope(role, module.id);
+  });
 }
 
 function hasScope(role, scope) {
@@ -1472,6 +1677,7 @@ function loadData() {
 function persistData() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(appState.data));
   if (appState.fileHandle) writeToFileHandle(appState.fileHandle, appState.data);
+  if (cloudEnabled()) cloudSyncAll(); // fire-and-forget
 }
 
 function getCurrentUser() {
@@ -1543,6 +1749,17 @@ document.addEventListener("click", function(e) {
 document.addEventListener("change", function(e) {
   const cb = e.target.closest("[data-ms-parent]");
   if (cb) msUpdateTags(cb.dataset.msParent);
+
+  // Payments: when Person type changes, repopulate Person name dropdown
+  if (e.target.name === "ownerType") {
+    const form = e.target.closest("form");
+    const nameSelect = form && form.querySelector("[data-persons-select]");
+    if (!nameSelect) return;
+    const type = e.target.value;
+    const people = (type === "patient" ? appState.data.patients : appState.data.students) || [];
+    nameSelect.innerHTML = `<option value="">Select ${type}…</option>` +
+      people.map(p => `<option value="${escapeHtml(p.fullName)}">${escapeHtml(p.fullName)}</option>`).join("");
+  }
 });
 
 document.addEventListener("input", function(e) {

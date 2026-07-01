@@ -999,6 +999,27 @@ tbody tr:hover {
 .sync-on  { background: #6ee87a; box-shadow: 0 0 6px #6ee87a; }
 .sync-off { background: #c07040; }
 
+/* ── Cloud sync indicator ── */
+.cloud-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 8px;
+  margin-top: 4px;
+  font-size: 0.82rem;
+}
+.cloud-sync-dot {
+  font-size: 0.9rem;
+  line-height: 1;
+  transition: opacity 0.3s;
+}
+.cloud-syncing { animation: cloud-spin 1s linear infinite; }
+@keyframes cloud-spin { to { opacity: 0.3; } }
+.cloud-sync-dot.cloud-online  { filter: hue-rotate(120deg); }
+.cloud-sync-dot.cloud-offline { filter: grayscale(1) opacity(0.5); }
+
 /* ── Reconnect button in sidebar ── */
 .reconnect-btn {
   width: 100%;

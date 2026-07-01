@@ -1,0 +1,10 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+
+# Multiuser server (local only)
+multiuser/*.db
+multiuser/*.pid
+multiuser/__pycache__/
